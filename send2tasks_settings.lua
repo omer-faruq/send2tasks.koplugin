@@ -271,6 +271,31 @@ function Settings.showQuickSwitch(plugin, refresh_callback)
         end,
     } })
 
+    local auto_connect = plugin:readSetting("auto_connect_when_offline", false)
+    table.insert(buttons, { {
+        text = auto_connect
+            and _("✓ Auto-connect Wi-Fi when offline")
+            or _("☐ Auto-connect Wi-Fi when offline"),
+        background = Blitbuffer.COLOR_WHITE,
+        callback = function()
+            plugin:saveSetting("auto_connect_when_offline", not auto_connect)
+            UIManager:close(dialog)
+            Settings.showQuickSwitch(plugin, refresh_callback)
+        end,
+    } })
+
+    local pending = plugin:countPending()
+    if pending > 0 then
+        table.insert(buttons, { {
+            text = T(_("Send pending now (%1)"), pending),
+            background = Blitbuffer.COLOR_WHITE,
+            callback = function()
+                UIManager:close(dialog)
+                Settings.flushPendingQueue(plugin)
+            end,
+        } })
+    end
+
     table.insert(buttons, { {
         text = _("Close"),
         background = Blitbuffer.COLOR_WHITE,
@@ -283,6 +308,49 @@ function Settings.showQuickSwitch(plugin, refresh_callback)
         buttons = buttons,
     }
     UIManager:show(dialog)
+end
+
+-- ---------------------------------------------------------------------------
+-- Pending queue helpers
+-- ---------------------------------------------------------------------------
+
+function Settings.flushPendingQueue(plugin)
+    if plugin:countPending() == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No pending tasks to send."),
+            timeout = 3,
+        })
+        return
+    end
+    local NetworkMgr = require("ui/network/manager")
+    if NetworkMgr:isOnline() then
+        plugin:drainQueue()
+        return
+    end
+    UIManager:show(Notification:new{
+        text = T(_("Offline — will send %1 pending task(s) when connected."),
+            plugin:countPending()),
+    })
+    NetworkMgr:runWhenOnline(function() end)
+end
+
+function Settings.confirmClearPending(plugin)
+    local pending = plugin:countPending()
+    if pending == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No pending tasks to discard."),
+            timeout = 3,
+        })
+        return
+    end
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Discard %1 pending task(s)? This cannot be undone."), pending),
+        ok_text = _("Discard"),
+        ok_callback = function()
+            plugin:clearPendingQueue()
+            UIManager:show(Notification:new{ text = _("Pending tasks discarded.") })
+        end,
+    })
 end
 
 -- ---------------------------------------------------------------------------
@@ -439,6 +507,60 @@ function Settings.buildMenu(plugin)
             local cur = plugin:readSetting("include_book_context", true)
             plugin:saveSetting("include_book_context", not cur)
             if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
+        keep_menu_open = true,
+    })
+
+    -- Auto-connect toggle for offline sends.
+    table.insert(items, {
+        text_func = function()
+            local on = plugin:readSetting("auto_connect_when_offline", false)
+            return on and _("Auto-connect Wi-Fi when offline: on")
+                or _("Auto-connect Wi-Fi when offline: off")
+        end,
+        help_text = _("When ON, sending a task while offline will prompt KOReader to bring Wi-Fi up immediately. When OFF (default), the task is silently queued and sent the next time you go online."),
+        callback = function(touchmenu_instance)
+            local cur = plugin:readSetting("auto_connect_when_offline", false)
+            plugin:saveSetting("auto_connect_when_offline", not cur)
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
+        keep_menu_open = true,
+    })
+
+    -- Pending queue management.
+    table.insert(items, {
+        text_func = function()
+            local n = plugin:countPending()
+            if n == 0 then return _("Pending tasks: none") end
+            return T(_("Pending tasks: %1"), n)
+        end,
+        sub_item_table_func = function()
+            local sub = {}
+            local n = plugin:countPending()
+            if n == 0 then
+                table.insert(sub, {
+                    text = _("Queue is empty."),
+                    enabled = false,
+                })
+                return sub
+            end
+            table.insert(sub, {
+                text = T(_("Send %1 pending task(s) now"), n),
+                callback = function(touchmenu_instance)
+                    Settings.flushPendingQueue(plugin)
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+                keep_menu_open = true,
+            })
+            table.insert(sub, {
+                text = _("Discard pending tasks"),
+                callback = function(touchmenu_instance)
+                    Settings.confirmClearPending(plugin)
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+                keep_menu_open = true,
+            })
+            return sub
         end,
         keep_menu_open = true,
     })

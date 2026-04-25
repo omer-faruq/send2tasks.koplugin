@@ -154,22 +154,12 @@ end
 -- Sending
 -- ---------------------------------------------------------------------------
 
-local function dispatchSend(plugin, account_id, list_id, title, notes, due_rfc3339)
-    local token, err = plugin:getValidAccessToken(account_id)
-    if not token then return false, err end
-    local ok, result = Api.createTask(token, list_id, title, notes, due_rfc3339)
-    if ok then return true, result end
-    -- If we got a 401 the cached token went stale between check and
-    -- request; force a refresh and retry once.
-    if tostring(result or ""):find("HTTP 401") or tostring(result or ""):find("%(401%)") then
-        plugin:saveAccountState(account_id, "access_token_expires_at", 0)
-        local token2, err2 = plugin:getValidAccessToken(account_id)
-        if not token2 then return false, err2 end
-        return Api.createTask(token2, list_id, title, notes, due_rfc3339)
-    end
-    return false, result
-end
-
+-- Fire-and-wait HTTP send when online. When offline, the task is
+-- persisted to the plugin's pending-queue so it can be flushed by
+-- `Send2Tasks:drainQueue()` on the next NetworkConnected event.
+-- Whether the plugin actively tries to bring the network up is gated
+-- by the `auto_connect_when_offline` user setting (default off) so
+-- reading is not interrupted by a Wi-Fi prompt the user did not ask for.
 local function sendTask(plugin, title, notes, due_rfc3339)
     local account, label, account_id = plugin:getActiveAccount()
     if not account then
@@ -190,18 +180,35 @@ local function sendTask(plugin, title, notes, due_rfc3339)
     end
     local list_id = plugin:getDefaultTaskListId(account_id) or "@default"
 
-    local perform = function()
+    local queue_item = {
+        account_id = account_id,
+        list_id = list_id,
+        title = title,
+        notes = notes,
+        due = due_rfc3339,
+        created_at = os.time(),
+    }
+
+    if NetworkMgr:isOnline() then
         Trapper:wrap(function()
             local trap = InfoMessage:new{
                 text = T(_("Sending task to %1…"), label),
                 timeout = nil,
             }
             UIManager:show(trap)
-            local ok, err = dispatchSend(plugin, account_id, list_id, title, notes, due_rfc3339)
+            local ok, err, transient = plugin:dispatchQueueItem(queue_item)
             UIManager:close(trap)
             if ok then
                 UIManager:show(Notification:new{
                     text = T(_("Sent to %1"), label),
+                })
+                return
+            end
+            if transient then
+                plugin:enqueuePending(queue_item)
+                UIManager:show(Notification:new{
+                    text = T(_("Network glitch — queued for retry (%1 pending)."),
+                        plugin:countPending()),
                 })
             else
                 UIManager:show(InfoMessage:new{
@@ -211,17 +218,23 @@ local function sendTask(plugin, title, notes, due_rfc3339)
                 })
             end
         end)
-    end
-
-    if NetworkMgr:isOnline() then
-        perform()
         return
     end
 
-    UIManager:show(Notification:new{
-        text = _("Offline — the task will be sent once online."),
-    })
-    NetworkMgr:runWhenOnline(perform)
+    -- Offline: always queue, then optionally try to bring Wi-Fi up.
+    plugin:enqueuePending(queue_item)
+    local pending = plugin:countPending()
+    local auto_connect = plugin:readSetting("auto_connect_when_offline", false)
+    if auto_connect then
+        UIManager:show(Notification:new{
+            text = T(_("Offline — queued (%1 pending). Trying to connect…"), pending),
+        })
+        NetworkMgr:runWhenOnline(function() end)
+    else
+        UIManager:show(Notification:new{
+            text = T(_("Offline — queued (%1 pending). Will send when you reconnect."), pending),
+        })
+    end
 end
 
 -- ---------------------------------------------------------------------------

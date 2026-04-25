@@ -17,11 +17,15 @@ local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local LuaSettings = require("luasettings")
+local Notification = require("ui/widget/notification")
+local Trapper = require("ui/trapper")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local lfs = require("libs/libkoreader-lfs")
 local _ = require("gettext")
+local T = require("ffi/util").template
 
+local Api = require("send2tasks_api")
 local Auth = require("send2tasks_auth")
 local NoteDialog = require("send2tasks_note_dialog")
 local SettingsModule = require("send2tasks_settings")
@@ -126,7 +130,14 @@ function Send2Tasks:resetRememberedSettings()
     if not self.settings then
         self.settings = LuaSettings:open(SETTINGS_FILE)
     end
+    -- Preserve the pending-queue across a settings reset: discarding
+    -- queued tasks silently would lose user content. The dedicated
+    -- "Discard pending tasks" entry is the only way to clear the queue.
+    local preserved_queue = self:loadPendingQueue()
     self.settings:reset({})
+    if #preserved_queue > 0 then
+        self.settings:saveSetting("pending_queue", preserved_queue)
+    end
     self.settings:flush()
     self:refreshHighlightButton()
 end
@@ -418,6 +429,157 @@ function Send2Tasks:onSend2TasksOpenNote()
 end
 
 -- ---------------------------------------------------------------------------
+-- Pending queue (offline send buffer)
+-- ---------------------------------------------------------------------------
+--
+-- Same shape as the sibling plugins: an array of
+--   { account_id, list_id, title, notes, due, created_at }
+-- entries persisted under `pending_queue` in LuaSettings. The OAuth
+-- refresh token is NOT stored here; it is resolved from the current
+-- configuration at drain time, so rotating credentials does not leak
+-- old secrets through the queue file.
+
+function Send2Tasks:loadPendingQueue()
+    local q = self:readSetting("pending_queue", nil)
+    if type(q) ~= "table" then return {} end
+    return q
+end
+
+function Send2Tasks:savePendingQueue(queue)
+    self:saveSetting("pending_queue", queue or {})
+end
+
+function Send2Tasks:enqueuePending(item)
+    if type(item) ~= "table" then return end
+    local queue = self:loadPendingQueue()
+    table.insert(queue, item)
+    self:savePendingQueue(queue)
+end
+
+function Send2Tasks:countPending()
+    return #self:loadPendingQueue()
+end
+
+function Send2Tasks:clearPendingQueue()
+    self:savePendingQueue({})
+end
+
+-- Resolve a queue item back to a Google Tasks API call. Performs the
+-- same access-token-with-401-retry dance as the synchronous send path
+-- in the note dialog. Returns ok, err, transient.
+function Send2Tasks:dispatchQueueItem(item)
+    if type(item) ~= "table" or not item.account_id then
+        return false, "Invalid queue item", false
+    end
+    if not self.CONFIGURATION or type(self.CONFIGURATION.accounts) ~= "table" then
+        return false, "Configuration is missing", false
+    end
+    local acc = self.CONFIGURATION.accounts[item.account_id]
+    if type(acc) ~= "table" then
+        return false, T(_("Account '%1' no longer exists in configuration"), item.account_id), false
+    end
+    if not self:hasRefreshToken(item.account_id) then
+        return false, T(_("Account '%1' is missing a refresh_token"), item.account_id), false
+    end
+    if type(item.title) ~= "string" or item.title == "" then
+        return false, "Task title is required", false
+    end
+
+    local list_id = item.list_id and item.list_id ~= "" and item.list_id or "@default"
+    local token, token_err = self:getValidAccessToken(item.account_id)
+    if not token then
+        local err_text = tostring(token_err or "")
+        local transient = err_text:find("Network error", 1, true)
+            or err_text:find("timed out", 1, true)
+            or err_text:find("Request timed out", 1, true)
+        return false, err_text ~= "" and err_text or "Token refresh failed",
+            transient and true or false
+    end
+
+    local ok, err = Api.createTask(token, list_id, item.title, item.notes, item.due)
+    if ok then return true, nil, false end
+
+    -- 401: cached access_token went stale. Force a refresh and retry once.
+    local err_text = tostring(err or "")
+    if err_text:find("HTTP 401") or err_text:find("%(401%)") then
+        self:saveAccountState(item.account_id, "access_token_expires_at", 0)
+        local token2, err2 = self:getValidAccessToken(item.account_id)
+        if not token2 then
+            return false, tostring(err2 or "Token refresh failed"), false
+        end
+        local ok2, err_retry = Api.createTask(token2, list_id, item.title, item.notes, item.due)
+        if ok2 then return true, nil, false end
+        err_text = tostring(err_retry or "")
+    end
+
+    local transient = err_text:find("Network error", 1, true)
+        or err_text:find("timed out", 1, true)
+        or err_text:find("Request timed out", 1, true)
+    return false, err_text ~= "" and err_text or "Unknown error", transient and true or false
+end
+
+function Send2Tasks:drainQueue(opts)
+    opts = opts or {}
+    if self._draining then return end
+    local NetworkMgr = require("ui/network/manager")
+    if not NetworkMgr:isOnline() then return end
+    local queue = self:loadPendingQueue()
+    if #queue == 0 then return end
+
+    self._draining = true
+    Trapper:wrap(function()
+        local sent, dropped = 0, 0
+        local last_err
+        local remaining = {}
+        local stopped_for_network = false
+        for _, item in ipairs(queue) do
+            if stopped_for_network then
+                table.insert(remaining, item)
+            else
+                local ok, err, transient = self:dispatchQueueItem(item)
+                if ok then
+                    sent = sent + 1
+                else
+                    last_err = err
+                    if transient or not NetworkMgr:isOnline() then
+                        stopped_for_network = true
+                        table.insert(remaining, item)
+                    else
+                        dropped = dropped + 1
+                        logger.warn("send2tasks: dropped queued item:", err)
+                    end
+                end
+            end
+        end
+        self:savePendingQueue(remaining)
+        self._draining = false
+
+        if opts.silent then return end
+        if sent == 0 and dropped == 0 then return end
+
+        local parts = {}
+        if sent > 0 then
+            table.insert(parts, T(_("Sent %1 pending task(s) to Google Tasks."), sent))
+        end
+        if dropped > 0 then
+            table.insert(parts, T(_("Dropped %1 (last error: %2)."),
+                dropped, last_err or _("unknown")))
+        end
+        if #remaining > 0 then
+            table.insert(parts, T(_("%1 still pending."), #remaining))
+        end
+        UIManager:show(Notification:new{ text = table.concat(parts, " ") })
+    end)
+end
+
+function Send2Tasks:onNetworkConnected()
+    if self:countPending() == 0 then return end
+    UIManager:scheduleIn(1, function()
+        self:drainQueue()
+    end)
+end
+
+-- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
@@ -434,6 +596,12 @@ end
 
 function Send2Tasks:onReaderReady()
     self:refreshHighlightButton()
+    if self:countPending() > 0 then
+        local NetworkMgr = require("ui/network/manager")
+        if NetworkMgr:isOnline() then
+            UIManager:scheduleIn(2, function() self:drainQueue() end)
+        end
+    end
 end
 
 return Send2Tasks
