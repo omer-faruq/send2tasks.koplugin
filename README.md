@@ -76,13 +76,23 @@ send2tasks.koplugin/
    - *APIs & Services → Library*
    - Search for "Google Tasks API" and click *Enable*.
 3. **Configure the OAuth consent screen**
-   - *APIs & Services → OAuth consent screen*
+   - *APIs & Services → Google Auth platform* (or *OAuth consent screen* in older layouts).
    - User type: **External**
    - Fill the required fields (app name, support email, developer
      contact).
    - While the project is still in "Testing" mode, add your own Google
      account under *Audience → Test users*.
-4. **Create OAuth client credentials**
+4. **⚠️ CRITICAL STEP: Switch from Testing to Production**
+   - By default, Google Cloud puts new projects in **Testing** status.
+     **Tokens generated in Testing mode expire automatically after 7 days!**
+   - To make your login permanent, stay on the *Google Auth platform /
+     OAuth consent screen* page, find the **Audience** tab (or the main
+     dashboard area), and click **Publish App** (or *Push to Production*).
+   - Confirm the prompt. The status must change to **In Production**.
+     (Don't worry about Google verification; since this is for personal
+     use, verification is not required and unverified status won't affect
+     your token life.)
+5. **Create OAuth client credentials**
    - *APIs & Services → Credentials → Create credentials → OAuth client ID*
    - Application type: **Web application**
      > ⚠️ Important: do *not* pick "TVs and Limited Input devices". The
@@ -94,7 +104,7 @@ send2tasks.koplugin/
      ```
      This is required so the OAuth Playground in step 2 can talk to
      your credentials.
-5. Copy the generated **Client ID** (ends with
+6. Copy the generated **Client ID** (ends with
    `.apps.googleusercontent.com`) and **Client secret** (usually starts
    with `GOCSPX-`). You will need both in step 2.
 
@@ -211,10 +221,9 @@ primary "My Tasks" list.
 - **"Account '…' is missing a refresh_token"**
   You copied the sample file but did not paste a real refresh_token
   yet. Follow step 2 and fill in the `refresh_token` field.
-- **"Could not obtain an access token: invalid_grant"**
-  The refresh_token was revoked (either you reset access from My
-  Account, or Google rotated it after inactivity). Repeat step 2 and
-  paste the new refresh_token.
+- **"Could not obtain an access token: invalid_grant"** or **dropped queued item: Bad Request**
+  The refresh_token was revoked or expired. This happens if you changed
+  your Google password, manually revoked access, if the app stayed inactive for 6 months or **if you forgot to switch the Google Cloud project to "Production" mode** (tokens generated in Testing mode expire after 7 days). Revisit Step 1 (point 4) to ensure your app status is *In Production*, then repeat Step 2 to generate a permanent token.
 - **"Could not obtain an access token: invalid_client"**
   The `client_id` / `client_secret` do not match a registered OAuth
   client. Double-check copy-paste; make sure you used the **Web
